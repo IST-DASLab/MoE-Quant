@@ -46,7 +46,7 @@ def parse_args():
         "--bits",
         type=int,
         default=4,
-        choices=[4],
+        choices=[2, 4],
         help="Quantization bitwidth.",
     )
     parser.add_argument(
@@ -78,6 +78,11 @@ def parse_args():
     parser.add_argument("--seed", default=0, type=int, help="Random seed.")
     parser.add_argument(
         "--dtype", default="float16", type=str, choices=["float16s", "bfloat16"], help="Torch dtype used."
+    )
+    parser.add_argument(
+        "--load_last_shard", 
+        action="store_true", 
+        help="Whether to load the last shard of the model in the beginning (needed from Kimi-K2-Thinking)."
     )
     args = parser.parse_args()
 
@@ -117,6 +122,8 @@ def main():
 
     # Load DeepSeek model
     config = AutoConfig.from_pretrained(args.model_name_or_path, trust_remote_code=True)
+    # Infer quantization format
+    orig_quantization_format = quant_utils.infer_quantization_format(config)
     # Sanity check
     assert config.architectures == ["DeepseekV3ForCausalLM"], "Only DeepseekV3 is supported!"
     if hasattr(config, "quantization_config"):
@@ -125,7 +132,10 @@ def main():
 
     with init_empty_weights():
         model = AutoModelForCausalLM.from_config(
-            config=config, trust_remote_code=True, attn_implementation="flash_attention_2", torch_dtype=dtype
+            config=config, 
+            trust_remote_code=True, 
+            attn_implementation="flash_attention_2", 
+            torch_dtype=dtype
         ).eval()
         model.config.use_cache = False
 
@@ -141,14 +151,26 @@ def main():
     calibration_dataset = calibration_dataset[rank * num_seq_per_rank : (rank + 1) * num_seq_per_rank]
     dist_utils.barrier(device_ids=[rank])
 
+    # Get num shards
+    for path in os.listdir(args.model_name_or_path):
+        if path.endswith(".safetensors"):
+            num_shards_str = path.split(".")[0].split("-")[-1]
+            num_shards = int(num_shards_str)
+            break
+
     # Load initial weight shard
     weight_dir = args.model_name_or_path
     current_shard_id = 1
-    weight_path = f"model-{current_shard_id:05}-of-000163.safetensors"
+    weight_path = f"model-{current_shard_id:05}-of-{num_shards_str}.safetensors"
 
     param_buffer = {}
     if dist_utils.is_main():
         param_buffer = loading_utils.load_param_shard(weight_dir, weight_path)
+        if args.load_last_shard:
+            last_shard_weight_path = f"model-{num_shards:05}-of-{num_shards_str}.safetensors"
+            last_shard = loading_utils.load_param_shard(weight_dir, last_shard_weight_path)
+            param_buffer.update(last_shard)
+
     dist_utils.barrier(device_ids=[rank])
 
     # Get resume block id
@@ -171,6 +193,9 @@ def main():
     # Offload embeddings back to meta
     model.model.embed_tokens.to(device="meta")
     param_buffer.pop("model.embed_tokens.weight", None)
+    # Pop lm head and norm in case it is loaded from last shard
+    param_buffer.pop("lm_head.weight", None)
+    param_buffer.pop("model.norm.weight", None)
 
     for block_idx, block in tqdm(
         enumerate(model.model.layers), desc="Processing transformer blocks", total=len(model.model.layers)
@@ -197,16 +222,20 @@ def main():
         if dist_utils.is_main():
             can_dequantize = True
             # Select weights corresponding to current block
-            block_state_dict = {k[len(prefix) :]: v for k, v in param_buffer.items() if k.startswith(prefix)}
+            block_state_dict = {k[len(prefix):]: v for k, v in param_buffer.items() if k.startswith(prefix)}
             while not (is_subset(block_keys_with_prefix, set(param_buffer.keys())) and can_dequantize):
                 current_shard_id += 1
-                weight_path = f"model-{current_shard_id:05}-of-000163.safetensors"
-                param_buffer.update(loading_utils.load_param_shard(weight_dir, weight_path))
+                weight_path = f"model-{current_shard_id:05}-of-{num_shards_str}.safetensors"
+                param_shard = loading_utils.load_param_shard(weight_dir, weight_path)
+                # Dequantize weights from a current shard
+                if quant_utils.can_dequantize(param_shard, orig_quantization_format):
+                    quant_utils.dequantize_state_dict(param_shard, dtype, orig_quantization_format)
+                param_buffer.update(param_shard)
                 # Update weights corresponding to current block
                 block_state_dict = {k[len(prefix) :]: v for k, v in param_buffer.items() if k.startswith(prefix)}
-                can_dequantize = quant_utils.can_dequantize_from_fp8(block_state_dict)
+                can_dequantize = quant_utils.can_dequantize(block_state_dict, orig_quantization_format)
             # Dequantize weights corresponding to current block
-            quant_utils.dequantize_state_dict(block_state_dict, dtype)
+            quant_utils.dequantize_state_dict(block_state_dict, dtype, orig_quantization_format)
 
         # Put block onto GPU
         block.to_empty(device=device)
@@ -214,7 +243,7 @@ def main():
         # Simply load block state dict on master and broadcast
         if block_idx < model.config.first_k_dense_replace:
             if dist_utils.is_main():
-                block.load_state_dict(block_state_dict)
+                block.load_state_dict(block_state_dict, strict=False)
             if dist_utils.is_dist_available_and_initialized():
                 dist_utils.broadcast_parameters(block)
         # Send dict with part of expets to target device
@@ -222,7 +251,7 @@ def main():
             if dist_utils.is_main():
                 # Load state dict on master
                 rank_state_dict = {k: block_state_dict[k] for k in rank_block_keys}
-                block.load_state_dict(rank_state_dict)
+                block.load_state_dict(rank_state_dict, strict=False)
                 # Send to other processes
                 for i in range(1, world_size):
                     rank_state_dict = {k: block_state_dict[k] for k in other_ranks_keys[i - 1]}
@@ -232,7 +261,7 @@ def main():
                 rank_state_dict = block.state_dict()
                 for k in rank_state_dict:
                     dist.recv(rank_state_dict[k], src=0)
-                block.load_state_dict(rank_state_dict)
+                block.load_state_dict(rank_state_dict, strict=False)
             del rank_state_dict
         # Clear memory before calibration
         torch.cuda.empty_cache()

@@ -6,6 +6,8 @@ import torch
 import torch.nn.functional as F
 import triton
 from triton import language as tl
+from transformers import AutoConfig
+from compressed_tensors.compressors import unpack_from_int32
 
 
 torch.backends.cuda.matmul.allow_tf32 = False
@@ -283,22 +285,80 @@ def dequantize_weight_from_fp8(W, s):
     return W
 
 
-def dequantize_state_dict(state_dict: dict[str, torch.Tensor], dtype: torch.dtype = torch.float16) -> None:
+def dequantize_state_dict(
+    state_dict: dict[str, torch.Tensor], 
+    dtype: torch.dtype = torch.float16,
+    quantization_format: str = "fp8"
+) -> None:
+    assert quantization_format in ["fp8", "int4"]
     state_dict_keys = list(state_dict.keys())
-    # Dequantize
-    for k in state_dict_keys:
-        if k.endswith("scale_inv"):
-            layer_name, _ = k.rsplit(".", 1)
 
-            W = state_dict[f"{layer_name}.weight"].to(dtype)
-            s = state_dict[f"{layer_name}.weight_scale_inv"].to(dtype)
+    # Original DeepSeek packing
+    if quantization_format == "fp8":
+        # Dequantize
+        for k in state_dict_keys:
+            if k.endswith("scale_inv"):
+                layer_name, _ = k.rsplit(".", 1)
 
-            state_dict[f"{layer_name}.weight"] = dequantize_weight_from_fp8(W, s)
-            del state_dict[f"{layer_name}.weight_scale_inv"]
+                W = state_dict[f"{layer_name}.weight"].to(dtype)
+                s = state_dict[f"{layer_name}.weight_scale_inv"].to(dtype)
+
+                state_dict[f"{layer_name}.weight"] = dequantize_weight_from_fp8(W, s)
+                del state_dict[f"{layer_name}.weight_scale_inv"]
+
+    # KIMI-K2 compressed tensors packing
+    elif quantization_format == "int4":
+        # Dequantize
+        for k in state_dict_keys:
+            if k.endswith("weight_packed"):
+                layer_name, _ = k.rsplit(".", 1)
+
+                weight_shape = state_dict[f"{layer_name}.weight_shape"]
+
+                qweight_packed = state_dict[f"{layer_name}.weight_packed"]
+                qweight = unpack_from_int32(qweight_packed, num_bits=4, shape=weight_shape)
+
+                scale = state_dict[f"{layer_name}.weight_scale"]
+                
+                W = (qweight.view(*scale.shape, -1) * scale[..., None]).view_as(qweight).to(dtype)
+
+                state_dict[f"{layer_name}.weight"] = W
+                del state_dict[f"{layer_name}.weight_packed"]
+                del state_dict[f"{layer_name}.weight_shape"]
+                del state_dict[f"{layer_name}.weight_scale"]
 
 
-def can_dequantize_from_fp8(state_dict: dict[str, torch.Tensor]) -> bool:
-    for k, v in state_dict.items():
-        if v.dtype in FP8_DTYPES and f"{k}_scale_inv" not in state_dict:
-            return False
+def can_dequantize(
+    state_dict: dict[str, torch.Tensor],
+    quantization_format: str = "fp8"
+) -> bool:
+    assert quantization_format in ["fp8", "int4"]
+     # Original DeepSeek packing
+    if quantization_format == "fp8":
+        for k, v in state_dict.items():
+            if v.dtype in FP8_DTYPES and f"{k}_scale_inv" not in state_dict:
+                return False
+            
+    # KIMI-K2 compressed tensors packing
+    elif quantization_format == "int4":
+        for k, v in state_dict.items():
+            if k.endswith("weight_packed"):
+                layer_name, _ = k.rsplit(".", 1)
+                if f"{layer_name}.weight_shape" not in state_dict or f"{layer_name}.weight_scale" not in state_dict:
+                    return False
     return True
+
+
+def infer_quantization_format(config: AutoConfig) -> str:
+    quant_method = config.quantization_config["quant_method"]
+    # DeepSeek format
+    if quant_method == "fp8":
+        return "fp8"
+    # KIMI-K2 format
+    elif quant_method == "compressed-tensors":
+        if config.quantization_config["config_groups"]["group_0"]["weights"]["num_bits"] == 4:
+            return "int4"
+        else:
+            raise ValueError("Only 4-bit quantization is supported.")
+    else:
+        raise ValueError("Unknown or unsupported quantization method.")

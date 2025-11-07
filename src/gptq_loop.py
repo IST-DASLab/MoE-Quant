@@ -10,7 +10,7 @@ torch.set_float32_matmul_precision("highest")
 
 
 @triton.jit
-def quantize_error_triton_kernel(
+def sparse_quantize_error_triton_kernel(
     x_ptr,
     qx_ptr,
     error_ptr,
@@ -19,6 +19,8 @@ def quantize_error_triton_kernel(
     maxq_ptr,
     dtype_ptr,
     n_elements: int,
+    sparse_n: tl.constexpr,
+    sparse_m: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
@@ -31,7 +33,24 @@ def quantize_error_triton_kernel(
     maxq = tl.load(maxq_ptr)
     dtype = None if dtype_ptr is None else tl.load(dtype_ptr).dtype
 
-    qx = tl_quantize(x, scale, qzero, maxq)
+    # Prune
+    if sparse_m > 0:
+        sparse_offsets = tl.arange(0, sparse_m)
+        sx = x.reshape(BLOCK_SIZE // sparse_m, sparse_m)
+        score = sx.abs()
+        sparse_mask = tl.zeros(score.shape, dtype=tl.int1)
+        for i in range(sparse_n):
+            max_idx = tl.argmin(score, axis=1, keep_dims=True)
+            sparse_mask_i = sparse_offsets == max_idx
+            sparse_mask = sparse_mask | sparse_mask_i
+            score = tl.where(sparse_mask_i, float("inf"), score)
+        sx = tl.where(sparse_mask, 0, sx)
+        sx = sx.reshape(BLOCK_SIZE)
+    else:
+        sx = x
+
+    # Quantize
+    qx = tl_quantize(sx, scale, qzero, maxq)
     y = tl_dequantize(qx, scale, qzero, dtype)
     error = y - x
 
@@ -40,19 +59,23 @@ def quantize_error_triton_kernel(
     tl.store(error_ptr + offsets, error, mask=mask)
 
 
-def quantize_error_triton(
+def sparse_quantize_error_triton(
     x: torch.Tensor,
     qx: torch.Tensor,
     error: torch.Tensor,
     scale: torch.Tensor,
     qzero: torch.Tensor,
     maxq: torch.Tensor,
+    sparse_n: int = 0,
+    sparse_m: int = 0,
     dtype: torch.dtype = None,
 ) -> None:
+    if sparse_m > 0:
+        assert 0 < sparse_n < sparse_m, "sparse_n must be in (0, sparse_m)"
 
     n_elements: int = x.numel()
     grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
-    quantize_error_triton_kernel[grid](
+    sparse_quantize_error_triton_kernel[grid](
         x,
         qx,
         error,
@@ -61,6 +84,8 @@ def quantize_error_triton(
         maxq,
         torch.empty(0, dtype=dtype) if dtype is not None else None,
         n_elements,
+        sparse_n,
+        sparse_m,
         BLOCK_SIZE=128,
     )
 
@@ -115,6 +140,8 @@ def gptq_loop_graph(
     error_block: torch.Tensor = None,
     dtype: torch.dtype = None,
     gptq_block_size: int = 128,
+    sparse_n: int = 0,
+    sparse_m: int = 0,
     direct: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
@@ -141,8 +168,8 @@ def gptq_loop_graph(
         for i1 in range(0, n_columns, gptq_block_size):
             i2: int = min(i1 + gptq_block_size, n_columns)
             for j in range(i1, i2):
-                quantize_error_triton(
-                    weight[j], qweight[j], error_block[j - i1], scale[j], qzero[j], maxq, dtype,
+                sparse_quantize_error_triton(
+                    weight[j], qweight[j], error_block[j - i1], scale[j], qzero[j], maxq, sparse_n, sparse_m, dtype,
                 )
                 addvv_triton(hessian_inv[j, j + 1 : i2], error_block[j - i1], weight[j + 1 : i2])
             weight[i2:].addmm_(hessian_inv[i1:i2, i2:].t(), error_block[: i2 - i1], beta=1, alpha=1)
@@ -169,10 +196,10 @@ def gptq_loop_graph(
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
             for _ in range(n_warmups):
-                gptq_loop_graph(**graph_tensors, dtype=dtype, gptq_block_size=gptq_block_size, direct=True)
+                gptq_loop_graph(**graph_tensors, dtype=dtype, gptq_block_size=gptq_block_size, sparse_n=sparse_n, sparse_m=sparse_m, direct=True)
         torch.cuda.current_stream().wait_stream(s)
         with torch.cuda.graph(graph):
-            gptq_loop_graph(**graph_tensors, dtype=dtype, gptq_block_size=gptq_block_size, direct=True)
+            gptq_loop_graph(**graph_tensors, dtype=dtype, gptq_block_size=gptq_block_size, sparse_n=sparse_n, sparse_m=sparse_m, direct=True)
         gptq_loop_graph.graph_info[graph_key] = {"graph": graph, "tensors": graph_tensors}
 
     graph, graph_tensors = (
@@ -198,6 +225,8 @@ def gptq_loop(
     maxq: torch.Tensor,
     dtype: torch.dtype,
     gptq_block_size: int = 128,
+    sparse_n: int = 0,
+    sparse_m: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize weight tensor with GPTQ algorithm
@@ -220,6 +249,8 @@ def gptq_loop(
         maxq=maxq,
         dtype=dtype,
         gptq_block_size=gptq_block_size,
+        sparse_n=sparse_n,
+        sparse_m=sparse_m,
         direct=False,
     )
     return qweight # (C, R)

@@ -7,44 +7,30 @@ import torch.distributed as dist
 from torch import Tensor
 from torch.nn.modules.conv import _ConvNd
 
-from src import dist_utils, model_utils, linalg_utils, quant_utils, gptq_loop
+from src import dist_utils, model_utils, linalg_utils
 
 
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 
 
-class QuantizationOrder(Enum):
-    DEFAULT = "default"
-    ACTIVATION = "activation"
-
-
-class GPTQ:
+class SparseGPT:
 
     def __init__(
         self,
         layer: nn.Module,
-        group_size: Optional[int] = None,
-        sym: bool = False,
         rel_damp: float = 1e-2,
         block_size: int = None,
-        quantization_order: str = "default",
-        quantization_scale: str = "absmax",
         is_distributed: bool = False,
-        tied_gptq_handle: Optional["GPTQ"] = None
+        tied_sparsegpt_handle: Optional["SparseGPT"] = None
     ):
         self._validate_layer(layer)
         self.layer = layer
         self.W = self.layer.weight
         self.d_row, self.d_col = model_utils.get_number_of_rows_and_cols(layer)
-        # Quantization hyperparameters
-        self.sym = sym
-        self.group_size = group_size
-        # GPTQ hyperparameters
+        # SparseGPT hyperparameters
         self.rel_damp = rel_damp
         self.block_size = block_size or self.d_col
-        self.quantization_order = QuantizationOrder(quantization_order)
-        self.quantization_scale = quantization_scale
         # backup layer properties
         self.W_device = self.W.device
         self.W_dtype = self.W.dtype
@@ -53,10 +39,10 @@ class GPTQ:
         self.H = None
         self.num_samples = 0
         self.is_distributed = is_distributed
-        self.tied_gptq_handle = tied_gptq_handle
+        self.tied_sparsegpt_handle = tied_sparsegpt_handle
         self.num_tied_handles = 0
-        if tied_gptq_handle is not None:
-            tied_gptq_handle.num_tied_handles += 1
+        if tied_sparsegpt_handle is not None:
+            tied_sparsegpt_handle.num_tied_handles += 1
         # Flags indicating issues
         self.issue_zero_samples = False
         self.issue_nan_hessian = False
@@ -112,23 +98,23 @@ class GPTQ:
         self.W = self.layer.weight
         if self.num_tied_handles == 0:
             self.H = None
-        elif self.tied_gptq_handle:
-            self.tied_gptq_handle.num_tied_handles -= 1
-            if self.tied_gptq_handle.num_tied_handles == 0:
-                self.tied_gptq_handle.H = None
+        elif self.tied_sparsegpt_handle:
+            self.tied_sparsegpt_handle.num_tied_handles -= 1
+            if self.tied_sparsegpt_handle.num_tied_handles == 0:
+                self.tied_sparsegpt_handle.H = None
         self.num_samples = 0
         torch.cuda.empty_cache()
 
     @torch.no_grad()
-    def quantization_pre_step(self) -> None:
+    def sparsification_pre_step(self) -> None:
         """
         Preparatory step with hessian regularization and weight reshaping.
         """
         # 1) Hessian preparation
         reduce_if_needed = True
         if self.H is None:
-            if self.tied_gptq_handle:
-                self.H = self.tied_gptq_handle.H
+            if self.tied_sparsegpt_handle:
+                self.H = self.tied_sparsegpt_handle.H
             else:
                 self.H = torch.eye(self.d_col, device=self.W_device, dtype=torch.float32)
                 self.issue_zero_samples = True
@@ -154,70 +140,65 @@ class GPTQ:
         self.pre_step_completed = True
 
     @torch.no_grad()
-    def _quantize(self, bits: int, sparse_n: int = 0, sparse_m: int = 0) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _prune(self, n: int = 2, m: int = 4) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Quantize the weight matrix using GPTQ
+        Prune the layer according to the given sparsity.
         """
         # 1) Define constants and chunk
         d_row, d_col, block_size, device, dtype = self.d_row, self.d_col, self.block_size, self.W_device, self.W_dtype
-        # 2) Get quantization group size
-        group_size = self.group_size or d_col
-        num_groups = d_col // group_size
 
-        is_main_gptq_process = dist_utils.is_main() or not self.is_distributed
+        is_main_sparsegpt_process = dist_utils.is_main() or not self.is_distributed
 
-        if is_main_gptq_process:
-            # Get scale, qzero 
-            scale, zero, maxq = quant_utils.get_quantization_grid(
-                weight=self.W,
-                group_size=self.group_size,
-                bits=bits,
-                symmetric=self.sym,
-                dtype=dtype,
-                quantization_scale=self.quantization_scale,
-            )
-            # Get permutation
-            if self.quantization_order == QuantizationOrder.ACTIVATION:
-                perm = torch.argsort(self.H.diag(), descending=True)
-            else:
-                perm = torch.arange(d_col, device=device)
-            perm_inv = torch.argsort(perm)
-            # Permute Hessian prior to inversion (if reusing hessian from other handle, Hessian is already permuted)
-            if not self.tied_gptq_handle:
-                self.H = self.H[perm][:, perm]
+        if is_main_sparsegpt_process:
+            w = self.W
+            # Get hessian inverse
+            hessian_inv = self._get_hessian_inverse()  
              # Get hessian inverse
-            hessian_inv = self._get_hessian_inverse()
-            # Quantize
-            qweight = gptq_loop.gptq_loop(
-                weight=self.W.transpose(-2, -1)[perm],  
-                hessian_inv=hessian_inv,
-                scale=scale.transpose(-2, -1)[perm], 
-                qzero=zero.transpose(-2, -1)[perm],  
-                maxq=maxq, 
-                dtype=dtype,
-                gptq_block_size=block_size,
-                sparse_n=sparse_n,
-                sparse_m=sparse_m,
-            )[perm_inv].transpose(-2, -1).contiguous().to(torch.uint8)
-            # Remove scale and zero replication  
-            scale = scale[:, ::group_size].to(dtype)
-            zero = zero[:, ::group_size].to(dtype)
+            for c1 in range(0, d_col, block_size):
+                c2 = min(c1 + block_size, d_col)
+                ncols = c2 - c1  # number of columns
+                w_blk = w[:, c1:c2].clone()  # column-wise weight slice
+                res = torch.zeros_like(w_blk)
+                errs = torch.zeros_like(w_blk)
+                losses_blk = torch.zeros_like(w_blk)
+                hessian_inv_blk = hessian_inv[c1:c2, c1:c2]
+                mask = torch.zeros_like(w_blk, dtype=torch.bool)
+                # 2) iterate over block
+                for i in range(ncols):
+                    if i % m == 0:
+                        scores = w_blk[:, i: (i + m)].pow(2) / hessian_inv_blk.diag()[i: (i + m)].view(1, -1).pow(2)
+                        thr, _ = torch.kthvalue(scores, k=n, dim=-1, keepdim=True)
+                        mask[:, i: (i + m)] = scores > thr
+
+                    w_ci = w_blk[:, i]
+                    d = hessian_inv_blk[i, i]
+
+                    q = w_ci.clone()
+                    q[~mask[:, i]] = 0
+
+                    res[:, i] = q
+                    err = (w_ci - q) / d
+                    losses_blk[:, i] = err ** 2
+
+                    w_blk[:, i:].addr_(err, hessian_inv_blk[i, i:], alpha=-1)
+                    errs[:, i] = err
+                # 3) update the weights after block
+                w[:, c1:c2] = res
+                w[:, c2:].addmm_(errs, hessian_inv[c1:c2, c2:], alpha=-1)
+
+            sweight = w.to(dtype=dtype)
         else:
-            qweight = torch.empty(d_row, d_col, device=device, dtype=torch.uint8)
-            scale = torch.empty(d_row, num_groups, device=device, dtype=dtype)
-            zero = torch.empty(d_row, num_groups, device=device, dtype=dtype)
+            sweight = torch.empty(d_row, d_col, device=device, dtype=dtype)
         
         if self.is_distributed and dist_utils.is_dist_available_and_initialized():
             dist.barrier()
-            dist.broadcast(qweight, src=0)
-            dist.broadcast(scale, src=0)
-            dist.broadcast(zero, src=0)
+            dist.broadcast(sweight, src=0)
 
-        return qweight, scale, zero
+        return sweight
 
-    def quantize(self, bits: int, sparse_n: int = 0, sparse_m: int = 0) -> Tensor:
-        self.quantization_pre_step()
-        return self._quantize(bits, sparse_n, sparse_m)
+    def prune(self, n: int = 2, m: int = 4) -> Tensor:
+        self.sparsification_pre_step()
+        return self._prune(n, m)
 
     @torch.no_grad()
     def _get_hessian_inverse(self):
@@ -225,8 +206,8 @@ class GPTQ:
         # Get columns with all zeros
         zero_cols = torch.nonzero(w.eq(0).all(dim=0))
         H = self.H
-        # Regularize Hessian before quantization
-        if not self.tied_gptq_handle:
+        # Regularize Hessian before sparsification
+        if not self.tied_sparsegpt_handle:
             # Mask rows with zero input channels
             H[zero_cols, :] = 0
             H[:, zero_cols] = 0
