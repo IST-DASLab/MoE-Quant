@@ -154,7 +154,7 @@ class GPTQ:
         self.pre_step_completed = True
 
     @torch.no_grad()
-    def _quantize(self, bits: int, sparse_n: int = 0, sparse_m: int = 0) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _quantize(self, bits: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Quantize the weight matrix using GPTQ
         """
@@ -196,8 +196,6 @@ class GPTQ:
                 maxq=maxq, 
                 dtype=dtype,
                 gptq_block_size=block_size,
-                sparse_n=sparse_n,
-                sparse_m=sparse_m,
             )[perm_inv].transpose(-2, -1).contiguous().to(torch.uint8)
             # Remove scale and zero replication  
             scale = scale[:, ::group_size].to(dtype)
@@ -215,9 +213,9 @@ class GPTQ:
 
         return qweight, scale, zero
 
-    def quantize(self, bits: int, sparse_n: int = 0, sparse_m: int = 0) -> Tensor:
+    def quantize(self, bits: int) -> Tensor:
         self.quantization_pre_step()
-        return self._quantize(bits, sparse_n, sparse_m)
+        return self._quantize(bits)
 
     @torch.no_grad()
     def _get_hessian_inverse(self):
