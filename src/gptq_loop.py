@@ -31,6 +31,7 @@ def quantize_error_triton_kernel(
     maxq = tl.load(maxq_ptr)
     dtype = None if dtype_ptr is None else tl.load(dtype_ptr).dtype
 
+    # Quantize
     qx = tl_quantize(x, scale, qzero, maxq)
     y = tl_dequantize(qx, scale, qzero, dtype)
     error = y - x
