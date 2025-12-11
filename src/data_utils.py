@@ -1,9 +1,18 @@
+import re
 from typing import Optional, List
 
 import torch
 from datasets import load_dataset
 from transformers import AutoTokenizer
 
+
+def split_thought_solution(text: str):
+    thought_re = re.compile(r"<\|begin_of_thought\|>(.*?)<\|end_of_thought\|>", re.DOTALL)
+    solution_re = re.compile(r"<\|begin_of_solution\|>(.*?)<\|end_of_solution\|>", re.DOTALL)
+
+    thought = thought_re.search(text).group(1).strip()
+    solution = solution_re.search(text).group(1).strip()
+    return thought, solution
 
 def prepare_open_thoughts(
     tokenizer: AutoTokenizer, 
@@ -14,6 +23,12 @@ def prepare_open_thoughts(
     train_dataset_raw = load_dataset("open-thoughts/OpenThoughts-114k", split="train")
     if num_calibration_samples:
         train_dataset_raw = train_dataset_raw.shuffle(seed=seed).select(range(num_calibration_samples))
+    # Update chat template
+    tokenizer.chat_template = tokenizer.chat_template.replace(
+        "<think></think>{{render_content(message)}}",
+        "{%- set rc = message.get('reasoning_content', '') -%}"
+        "<think>{{rc}}</think>{{render_content(message)}}"
+    )
     # Preprocess the data into the format the model is trained with.
     def preprocess(example):
         messages = []
@@ -21,7 +36,12 @@ def prepare_open_thoughts(
         messages.append({"role": "system", "content": example['system']})
         # add dialogue
         for message in example['conversations']:
-            messages.append({"role": message["from"], "content": message["value"]})
+            role = message["from"]
+            if role == "user":
+                messages.append({"role": "user", "content": message["value"]})
+            else:
+                thought, solution = split_thought_solution(message["value"])
+                messages.append({"role": "assistant", "content": solution, "reasoning_content": thought})
         return {"text": tokenizer.apply_chat_template(messages, tokenize=False)}
     train_dataset_raw = train_dataset_raw.map(preprocess)
     # Tokenize the data
