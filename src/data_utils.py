@@ -1,9 +1,10 @@
+import re
 from typing import Optional, List
 
 import torch
 from datasets import load_dataset
 from transformers import AutoTokenizer
-import re
+
 
 def split_thought_solution(text: str):
     thought_re = re.compile(r"<\|begin_of_thought\|>(.*?)<\|end_of_thought\|>", re.DOTALL)
@@ -11,7 +12,6 @@ def split_thought_solution(text: str):
 
     thought = thought_re.search(text).group(1).strip()
     solution = solution_re.search(text).group(1).strip()
-
     return thought, solution
 
 def prepare_open_thoughts(
@@ -23,13 +23,12 @@ def prepare_open_thoughts(
     train_dataset_raw = load_dataset("open-thoughts/OpenThoughts-114k", split="train")
     if num_calibration_samples:
         train_dataset_raw = train_dataset_raw.shuffle(seed=seed).select(range(num_calibration_samples))
-    tmpl = tokenizer.chat_template
-    tmpl = tmpl.replace(
+    # Update chat template
+    tokenizer.chat_template = tokenizer.chat_template.replace(
         "<think></think>{{render_content(message)}}",
         "{%- set rc = message.get('reasoning_content', '') -%}"
         "<think>{{rc}}</think>{{render_content(message)}}"
     )
-    tokenizer.chat_template = tmpl
     # Preprocess the data into the format the model is trained with.
     def preprocess(example):
         messages = []
