@@ -46,6 +46,11 @@ def parse_args():
         choices=["float16", "bfloat16"], 
         help="Torch dtype used."
     )
+    parser.add_argument(
+        "--load_last_shard", 
+        action="store_true", 
+        help="Whether to load the last shard of the model in the beginning (needed from Kimi-K2-Thinking)."
+    )
     args = parser.parse_args()
     return args
 
@@ -116,6 +121,8 @@ def main():
 
     # Load DeepSeek model
     config = AutoConfig.from_pretrained(args.model_name_or_path, trust_remote_code=True)
+    # Infer quantization format
+    orig_quantization_format = quant_utils.infer_quantization_format(config)
     if hasattr(config, "quantization_config"):
         delattr(config, "quantization_config")
 
@@ -148,12 +155,23 @@ def main():
     # Prepare directory to save packed weights
     os.makedirs(args.packed_model_path, exist_ok=True)
 
+    # Get num shards
+    for path in os.listdir(args.model_name_or_path):
+        if path.endswith(".safetensors"):
+            num_shards_str = path.split(".")[0].split("-")[-1]
+            num_shards = int(num_shards_str)
+            break
+
     # Load initial weight shard
     weight_dir = args.model_name_or_path
     current_input_shard_id = 1
-    weight_path = f"model-{current_input_shard_id:05}-of-000163.safetensors"
+    weight_path = f"model-{current_input_shard_id:05}-of-{num_shards_str}.safetensors"
 
     param_buffer = loading_utils.load_param_shard(weight_dir, weight_path)
+    if args.load_last_shard:
+        last_shard_weight_path = f"model-{num_shards:05}-of-{num_shards_str}.safetensors"
+        last_shard = loading_utils.load_param_shard(weight_dir, last_shard_weight_path)
+        param_buffer.update(last_shard)
 
     # Save embeddings
     current_output_shard_path = f"model-{current_output_shard_id:05}-of-{num_output_shards:05}.safetensors"
@@ -176,11 +194,15 @@ def main():
 
         while not is_subset(block_keys_with_prefix, set(param_buffer.keys())):
             current_input_shard_id += 1
-            weight_path = f"model-{current_input_shard_id:05}-of-000163.safetensors"
-            param_buffer.update(loading_utils.load_param_shard(weight_dir, weight_path))
+            weight_path = f"model-{current_input_shard_id:05}-of-{num_shards_str}.safetensors"
+            param_shard = loading_utils.load_param_shard(weight_dir, weight_path)
+            # Dequantize weights from a current shard
+            if quant_utils.can_dequantize(param_shard, orig_quantization_format):
+                quant_utils.dequantize_state_dict(param_shard, dtype, orig_quantization_format)
+            param_buffer.update(param_shard)
 
         block_state_dict = {k: param_buffer[k] for k in param_buffer if k.startswith(prefix)}
-        quant_utils.dequantize_state_dict(block_state_dict, dtype)
+        quant_utils.dequantize_state_dict(block_state_dict, dtype, orig_quantization_format)
 
         for layer_name in quantized_layer_names[block_idx]:
             weight_state_dict = torch.load(
@@ -189,7 +211,7 @@ def main():
                 map_location="cpu"
             )
             packed_weight_state_dict = pack_weight(weight_state_dict, args.bits, args.sym, args.group_size)
-            block_state_dict.pop(f"{layer_name}.weight")
+            block_state_dict.pop(f"{layer_name}.weight", None)
             block_state_dict.pop(f"{layer_name}.weight_scale_inv", None)
             block_state_dict.update({f"{layer_name}.{k}": v for k, v in packed_weight_state_dict.items()})
 
@@ -209,9 +231,9 @@ def main():
         gc.collect()
 
     # Load final shard
-    if current_input_shard_id < 163:
-        current_input_shard_id = 163
-        weight_path = f"model-{current_input_shard_id:05}-of-000163.safetensors"
+    if current_input_shard_id < num_shards:
+        current_input_shard_id = num_shards
+        weight_path = f"model-{current_input_shard_id:05}-of-{num_shards_str}.safetensors"
         param_buffer.update(loading_utils.load_param_shard(weight_dir, weight_path))
 
     # Save lm head

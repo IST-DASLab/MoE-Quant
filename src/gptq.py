@@ -213,7 +213,7 @@ class GPTQ:
 
         return qweight, scale, zero
 
-    def quantize(self, bits: int | float) -> Tensor:
+    def quantize(self, bits: int) -> Tensor:
         self.quantization_pre_step()
         return self._quantize(bits)
 
